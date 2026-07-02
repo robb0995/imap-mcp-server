@@ -36,6 +36,7 @@ export interface EmailMessage {
   messageId: string;
   inReplyTo?: string;
   flags: string[];
+  customKeywords: string[];
 }
 
 export type EmailBodyFormat = 'markdown' | 'text' | 'html' | 'auto';
@@ -79,6 +80,10 @@ export interface SearchCriteria {
   answered?: boolean;
   draft?: boolean;
   messageId?: string;
+  /** Match messages that have ANY of these custom keywords (server-side OR). */
+  keywords?: string[];
+  /** Exclude messages that have ANY of these custom keywords (server-side; result has NONE of them). */
+  unKeywords?: string[];
 }
 
 export interface EmailLocation {
@@ -90,6 +95,7 @@ export interface EmailLocation {
   from?: string;
   date?: Date;
   flags?: string[];
+  customKeywords?: string[];
   foldersSearched?: string[];
 }
 
@@ -118,4 +124,12 @@ export interface EmailAttachment {
   contentType?: string;
   contentDisposition?: 'attachment' | 'inline';
   cid?: string;
+}
+
+/** RFC 3501 system flags (documentation/tests only — see isSystemFlag for the authoritative check). */
+export const SYSTEM_FLAGS = ['\\Seen', '\\Answered', '\\Flagged', '\\Deleted', '\\Draft', '\\Recent'];
+
+/** RFC 3501: all system flags (and server extensions like `\*`) are backslash-prefixed; custom keywords never are. */
+export function isSystemFlag(flag: string): boolean {
+  return flag.startsWith('\\');
 }

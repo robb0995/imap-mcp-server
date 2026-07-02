@@ -13,8 +13,8 @@ class MockImapFlow {
   public searchMock = vi.fn().mockResolvedValue([]);
   public fetchMock = vi.fn();
   public fetchOneMock = vi.fn().mockResolvedValue(null);
-  public messageFlagsAddMock = vi.fn().mockResolvedValue(undefined);
-  public messageFlagsRemoveMock = vi.fn().mockResolvedValue(undefined);
+  public messageFlagsAddMock = vi.fn().mockResolvedValue(true);
+  public messageFlagsRemoveMock = vi.fn().mockResolvedValue(true);
   public messageDeleteMock = vi.fn().mockResolvedValue(undefined);
   public messageMoveMock = vi.fn().mockResolvedValue({ path: 'INBOX', destination: 'Archive', uidMap: new Map([[123, 456]]) });
   public mailboxCreateMock = vi.fn().mockResolvedValue({ path: 'NewFolder', created: true });
@@ -308,6 +308,67 @@ describe('ImapService', () => {
         expect.any(Object)
       );
     });
+
+    it('should search with a single custom keyword', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.searchEmails(mockAccount.id, 'INBOX', { keywords: ['Important'] });
+
+      expect(mockInstance.searchMock).toHaveBeenCalledWith(
+        expect.objectContaining({ keyword: 'Important' }),
+        expect.any(Object)
+      );
+    });
+
+    it('should OR multiple custom keywords', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.searchEmails(mockAccount.id, 'INBOX', { keywords: ['Important', 'ToRead'] });
+
+      expect(mockInstance.searchMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          or: [{ keyword: 'Important' }, { keyword: 'ToRead' }],
+        }),
+        expect.any(Object)
+      );
+    });
+
+    it('should exclude a single custom keyword via unKeyword', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.searchEmails(mockAccount.id, 'INBOX', { unKeywords: ['Archived'] });
+
+      expect(mockInstance.searchMock).toHaveBeenCalledWith(
+        expect.objectContaining({ unKeyword: 'Archived' }),
+        expect.any(Object)
+      );
+    });
+
+    it('should AND-exclude multiple custom keywords via NOT(OR(...))', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.searchEmails(mockAccount.id, 'INBOX', { unKeywords: ['Archived', 'Spammy'] });
+
+      expect(mockInstance.searchMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          not: { or: [{ keyword: 'Archived' }, { keyword: 'Spammy' }] },
+        }),
+        expect.any(Object)
+      );
+    });
+
+    it('should combine keywords with an existing criterion', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.searchEmails(mockAccount.id, 'INBOX', { seen: false, keywords: ['Important'] });
+
+      expect(mockInstance.searchMock).toHaveBeenCalledWith(
+        expect.objectContaining({ seen: false, keyword: 'Important' }),
+        expect.any(Object)
+      );
+    });
+
+    it('should reject a system flag passed as a custom keyword', async () => {
+      await imapService.connect(mockAccount);
+      await expect(
+        imapService.searchEmails(mockAccount.id, 'INBOX', { keywords: ['\\Seen'] })
+      ).rejects.toThrow(/system flag/);
+    });
   });
 
   describe('findEmailByMessageId', () => {
@@ -464,6 +525,41 @@ describe('ImapService', () => {
       expect(result[0].uid).toBe(4);
       expect(result[1].uid).toBe(3);
     });
+
+    it('derives customKeywords from flags, excluding system flags', async () => {
+      mockInstance.searchMock.mockResolvedValue([1]);
+      mockInstance.fetchMock.mockReturnValue({
+        [Symbol.asyncIterator]: () => {
+          let done = false;
+          return {
+            next: () => {
+              if (done) return Promise.resolve({ done: true });
+              done = true;
+              return Promise.resolve({
+                value: {
+                  uid: 1,
+                  internalDate: new Date('2025-01-01'),
+                  envelope: {
+                    from: [{ address: 'a@host' }],
+                    to: [],
+                    subject: 'Mixed flags',
+                    messageId: '<mixed@host>',
+                  },
+                  flags: new Set<string>(['\\Seen', '\\Flagged', '$cl_3']),
+                },
+                done: false,
+              });
+            },
+          };
+        },
+      });
+
+      await imapService.connect(mockAccount);
+      const result = await imapService.getLatestEmails(mockAccount.id, 'INBOX', 1);
+
+      expect(result[0].flags).toEqual(expect.arrayContaining(['\\Seen', '\\Flagged', '$cl_3']));
+      expect(result[0].customKeywords).toEqual(['$cl_3']);
+    });
   });
 
   describe('error handling', () => {
@@ -497,6 +593,94 @@ describe('ImapService', () => {
         ['\\Seen'],
         { uid: true }
       );
+    });
+  });
+
+  describe('flagEmail', () => {
+    it('should add Flagged flag', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.flagEmail(mockAccount.id, 'INBOX', 123);
+
+      expect(mockInstance.messageFlagsAddMock).toHaveBeenCalledWith(
+        123,
+        ['\\Flagged'],
+        { uid: true }
+      );
+    });
+  });
+
+  describe('unflagEmail', () => {
+    it('should remove Flagged flag', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.unflagEmail(mockAccount.id, 'INBOX', 123);
+
+      expect(mockInstance.messageFlagsRemoveMock).toHaveBeenCalledWith(
+        123,
+        ['\\Flagged'],
+        { uid: true }
+      );
+    });
+  });
+
+  describe('addKeyword', () => {
+    it('should add the given keyword verbatim', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.addKeyword(mockAccount.id, 'INBOX', 123, '$cl_3');
+
+      expect(mockInstance.messageFlagsAddMock).toHaveBeenCalledWith(
+        123,
+        ['$cl_3'],
+        { uid: true }
+      );
+    });
+
+    it('should throw when the server rejects or ignores the keyword change', async () => {
+      mockInstance.messageFlagsAddMock.mockResolvedValueOnce(false);
+      await imapService.connect(mockAccount);
+
+      await expect(
+        imapService.addKeyword(mockAccount.id, 'INBOX', 123, '$cl_3')
+      ).rejects.toThrow('Server did not apply keyword "$cl_3"');
+    });
+
+    it('should reject a system flag instead of applying it', async () => {
+      await imapService.connect(mockAccount);
+
+      await expect(
+        imapService.addKeyword(mockAccount.id, 'INBOX', 123, '\\Deleted')
+      ).rejects.toThrow('"\\Deleted" is a system flag, not a custom keyword');
+      expect(mockInstance.messageFlagsAddMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('removeKeyword', () => {
+    it('should remove the given keyword verbatim', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.removeKeyword(mockAccount.id, 'INBOX', 123, '$cl_3');
+
+      expect(mockInstance.messageFlagsRemoveMock).toHaveBeenCalledWith(
+        123,
+        ['$cl_3'],
+        { uid: true }
+      );
+    });
+
+    it('should throw when the server rejects or ignores the keyword change', async () => {
+      mockInstance.messageFlagsRemoveMock.mockResolvedValueOnce(false);
+      await imapService.connect(mockAccount);
+
+      await expect(
+        imapService.removeKeyword(mockAccount.id, 'INBOX', 123, '$cl_3')
+      ).rejects.toThrow('Server did not remove keyword "$cl_3"');
+    });
+
+    it('should reject a system flag instead of removing it', async () => {
+      await imapService.connect(mockAccount);
+
+      await expect(
+        imapService.removeKeyword(mockAccount.id, 'INBOX', 123, '\\Seen')
+      ).rejects.toThrow('"\\Seen" is a system flag, not a custom keyword');
+      expect(mockInstance.messageFlagsRemoveMock).not.toHaveBeenCalled();
     });
   });
 

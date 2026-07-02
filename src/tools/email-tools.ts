@@ -49,7 +49,7 @@ export function emailTools(
 
   // Search emails tool
   server.registerTool('imap_search_emails', {
-    description: 'Search for emails matching criteria (sender, recipient, subject, body text, date range, read/flagged status). Use this to FIND messages when you know something about them but not their UID — e.g. "emails from amazon last week", "unread invoices". By default searches a single folder (INBOX). Set searchAllFolders=true to scan every mailbox at once — this catches messages filed away by rules (e.g. a receipt routed to a custom folder); Trash/Spam/Drafts are skipped unless you opt in. Returns lightweight headers (uid, from, subject, date, and folder when searching across folders); call imap_get_email with a returned uid + folder to read full content. For the newest messages without criteria, prefer imap_get_latest_emails.',
+    description: 'Note: on some servers a \'flagged\' or starred message carries a custom keyword (e.g. an Open-Xchange color label or Apple\'s $MailFlagBit*) instead of, or in addition to, the \\Flagged system flag. After any flagged search, inspect each result\'s customKeywords field before concluding a message is or isn\'t flagged — do not rely on the flagged filter alone. Search for emails matching criteria (sender, recipient, subject, body text, date range, read/flagged status). Use this to FIND messages when you know something about them but not their UID — e.g. "emails from amazon last week", "unread invoices". By default searches a single folder (INBOX). Set searchAllFolders=true to scan every mailbox at once — this catches messages filed away by rules (e.g. a receipt routed to a custom folder); Trash/Spam/Drafts are skipped unless you opt in. Returns lightweight headers (uid, from, subject, date, and folder when searching across folders); call imap_get_email with a returned uid + folder to read full content. For the newest messages without criteria, prefer imap_get_latest_emails.',
     inputSchema: {
       ...accountSelector,
       folder: z.string().default('INBOX').describe('Folder name to search (default: INBOX). Ignored when searchAllFolders is true.'),
@@ -66,6 +66,8 @@ export function emailTools(
       seen: z.boolean().optional().describe('Filter by read/unread status'),
       flagged: z.boolean().optional().describe('Filter by flagged status'),
       messageId: z.string().optional().describe('Search by RFC822 Message-ID header (substring match)'),
+      keywords: z.array(z.string()).optional().describe('Match messages that have ANY of these CUSTOM keywords (server-side OR; not system flags like \\Seen/\\Flagged). Read a mailbox\'s available custom keywords from imap_folder_status\'s customKeywords field, then pass the ones you want here.'),
+      unKeywords: z.array(z.string()).optional().describe('Exclude messages that have ANY of these CUSTOM keywords (server-side; result has NONE of them). Same keyword source as `keywords` — check imap_folder_status first.'),
       limit: z.coerce.number().optional().default(50).describe('Maximum number of results'),
     }
   }, async ({ accountId: rawAccountId, accountName, folder, limit, searchAllFolders, includeTrash, includeSpam, includeDrafts, ...searchCriteria }) => {
@@ -81,6 +83,8 @@ export function emailTools(
     if (searchCriteria.seen !== undefined) criteria.seen = searchCriteria.seen;
     if (searchCriteria.flagged !== undefined) criteria.flagged = searchCriteria.flagged;
     if (searchCriteria.messageId) criteria.messageId = searchCriteria.messageId;
+    if (searchCriteria.keywords && searchCriteria.keywords.length > 0) criteria.keywords = searchCriteria.keywords;
+    if (searchCriteria.unKeywords && searchCriteria.unKeywords.length > 0) criteria.unKeywords = searchCriteria.unKeywords;
 
     // Cross-folder search: scan every selectable mailbox (minus the noisy ones,
     // unless opted in). A folder that fails to open is surfaced in foldersErrored
@@ -382,13 +386,107 @@ export function emailTools(
   }, async ({ accountId: rawAccountId, accountName, folder, uid }) => {
     const accountId = accountManager.resolveAccountId(rawAccountId, accountName);
     await imapService.markAsUnread(accountId, folder, uid);
-    
+
     return {
       content: [{
         type: 'text',
         text: JSON.stringify({
           success: true,
           message: `Email ${uid} marked as unread`,
+        }, null, 2)
+      }]
+    };
+  });
+
+  // Flag email tool
+  server.registerTool('imap_flag_email', {
+    description: 'Flag an email — sets the IMAP \\Flagged system flag (shows as a star in Gmail / a flag in Apple Mail). Use this tool when a user asks to star, flag, or mark a message as important.',
+    inputSchema: {
+      ...accountSelector,
+      folder: z.string().default('INBOX').describe('Folder name'),
+      uid: z.coerce.number().describe('Email UID'),
+    }
+  }, async ({ accountId: rawAccountId, accountName, folder, uid }) => {
+    const accountId = accountManager.resolveAccountId(rawAccountId, accountName);
+    await imapService.flagEmail(accountId, folder, uid);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          message: `Email ${uid} flagged`,
+        }, null, 2)
+      }]
+    };
+  });
+
+  // Unflag email tool
+  server.registerTool('imap_unflag_email', {
+    description: 'Unflag an email — removes the IMAP \\Flagged system flag (the star in Gmail, the flag in Apple Mail). Note: some servers (e.g. Open-Xchange / Network Solutions) and Apple Mail also write a separate custom keyword such as $cl_N or $MailFlagBit* when a message is flagged in their client. Removing \\Flagged alone does not clear that keyword, so the message may still display as flagged. If it does, check the message\'s customKeywords via imap_get_email and remove the lingering label with imap_remove_keyword.',
+    inputSchema: {
+      ...accountSelector,
+      folder: z.string().default('INBOX').describe('Folder name'),
+      uid: z.coerce.number().describe('Email UID'),
+    }
+  }, async ({ accountId: rawAccountId, accountName, folder, uid }) => {
+    const accountId = accountManager.resolveAccountId(rawAccountId, accountName);
+    await imapService.unflagEmail(accountId, folder, uid);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          message: `Email ${uid} unflagged`,
+        }, null, 2)
+      }]
+    };
+  });
+
+  // Add keyword tool
+  server.registerTool('imap_add_keyword', {
+    description: 'Set an arbitrary custom (non-system) IMAP keyword/label on an email — e.g. a provider color label like Open-Xchange\'s $cl_1..$cl_10, Apple Mail\'s $MailFlagBit0..$MailFlagBit2, or an app tag such as $promotion. Unlike imap_flag_email (which only ever sets the system \\Flagged flag), this passes the keyword through verbatim, but rejects backslash-prefixed system flags (e.g. \\Flagged, \\Seen, \\Deleted) — use the dedicated flag/read tools for those. Not every IMAP server permits custom keywords (see the mailbox\'s PERMANENTFLAGS) — if the server rejects or silently ignores the change, this call fails rather than reporting success.',
+    inputSchema: {
+      ...accountSelector,
+      folder: z.string().default('INBOX').describe('Folder name'),
+      uid: z.coerce.number().describe('Email UID'),
+      keyword: z.string().describe('IMAP keyword to set, passed through verbatim (e.g. "$cl_3", "$MailFlagBit0", "$Junk")'),
+    }
+  }, async ({ accountId: rawAccountId, accountName, folder, uid, keyword }) => {
+    const accountId = accountManager.resolveAccountId(rawAccountId, accountName);
+    await imapService.addKeyword(accountId, folder, uid, keyword);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          message: `Keyword "${keyword}" added to email ${uid}`,
+        }, null, 2)
+      }]
+    };
+  });
+
+  // Remove keyword tool
+  server.registerTool('imap_remove_keyword', {
+    description: 'Remove an arbitrary custom (non-system) IMAP keyword/label from an email — e.g. a provider color label like Open-Xchange\'s $cl_1..$cl_10, Apple Mail\'s $MailFlagBit0..$MailFlagBit2, or an app tag such as $promotion. Unlike imap_unflag_email (which only ever clears the system \\Flagged flag), this passes the keyword through verbatim, but rejects backslash-prefixed system flags (e.g. \\Flagged, \\Seen, \\Deleted) — use the dedicated flag/read tools for those. Not every IMAP server permits custom keywords (see the mailbox\'s PERMANENTFLAGS) — if the server rejects or silently ignores the change, this call fails rather than reporting success.',
+    inputSchema: {
+      ...accountSelector,
+      folder: z.string().default('INBOX').describe('Folder name'),
+      uid: z.coerce.number().describe('Email UID'),
+      keyword: z.string().describe('IMAP keyword to remove, passed through verbatim (e.g. "$cl_3", "$MailFlagBit0", "$Junk")'),
+    }
+  }, async ({ accountId: rawAccountId, accountName, folder, uid, keyword }) => {
+    const accountId = accountManager.resolveAccountId(rawAccountId, accountName);
+    await imapService.removeKeyword(accountId, folder, uid, keyword);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          message: `Keyword "${keyword}" removed from email ${uid}`,
         }, null, 2)
       }]
     };

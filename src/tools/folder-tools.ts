@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ImapService } from '../services/imap-service.js';
 import { AccountManager } from '../services/account-manager.js';
+import { isSystemFlag } from '../types/index.js';
 import { z } from 'zod';
 
 // Backward-compatible account selector (accountId stays accepted; accountName
@@ -50,7 +51,8 @@ export function folderTools(
   }, async ({ accountId: rawAccountId, accountName, folder }) => {
     const accountId = accountManager.resolveAccountId(rawAccountId, accountName);
     const box = await imapService.selectFolder(accountId, folder);
-    
+    const customKeywords = Array.from(box.flags || []).filter((f: string) => !isSystemFlag(f));
+
     return {
       content: [{
         type: 'text',
@@ -65,6 +67,7 @@ export function folderTools(
           uidnext: box.uidnext,
           flags: box.flags,
           permanentFlags: box.permanentFlags,
+          customKeywords,
         }, null, 2)
       }]
     };
