@@ -19,14 +19,38 @@ const accountSelector = {
 // Attachment payload as accepted by the send/draft/reply/forward tool schemas.
 // Typed explicitly because the MCP SDK's deep tool-schema inference (the TS2589
 // suppressions below) widens the handler's `attachments` arg to an untyped shape.
-type AttachmentInput = { filename: string; content?: string; path?: string; contentType?: string };
+type AttachmentInput = {
+  filename: string;
+  content?: string;
+  path?: string;
+  contentType?: string;
+  contentDisposition?: 'attachment' | 'inline';
+  cid?: string;
+};
 const buildAttachments = (atts?: AttachmentInput[]) =>
   atts?.map(att => ({
     filename: att.filename,
     content: att.content ? Buffer.from(att.content, 'base64') : undefined,
     path: att.path,
     contentType: att.contentType,
+    contentDisposition: att.contentDisposition,
+    cid: att.cid,
   }));
+
+// Shared Zod shape for the attachments arrays on send/save_draft/reply — keeps
+// the three tool schemas (and their .describe() text) in sync.
+const attachmentSchema = z.object({
+  filename: z.string().describe('Attachment filename'),
+  content: z.string().optional().describe('Base64 encoded content'),
+  path: z.string().optional().describe('File path to attach'),
+  contentType: z.string().optional().describe('MIME type'),
+  contentDisposition: z.enum(['attachment', 'inline']).optional().describe(
+    'How the attachment is presented. Use "inline" for images referenced from the HTML body via cid: (e.g. a signature/footer banner); omit or use "attachment" for regular downloadable files.'
+  ),
+  cid: z.string().optional().describe(
+    'Content-ID for inline attachments. Required when contentDisposition is "inline" and the HTML references the image as <img src="cid:THIS_VALUE">. Must match exactly (without the "cid:" prefix or angle brackets).'
+  ),
+});
 
 const DOWNLOAD_DIR = process.env.IMAP_DOWNLOAD_DIR || join(homedir(), 'Downloads', 'imap-attachments');
 const MAX_UPLOAD_SIZE = parseInt(process.env.IMAP_MAX_UPLOAD_SIZE ?? '', 10) || 25 * 1024 * 1024;
@@ -49,7 +73,7 @@ export function emailTools(
 
   // Search emails tool
   server.registerTool('imap_search_emails', {
-    description: 'Note: on some servers a \'flagged\' or starred message carries a custom keyword (e.g. an Open-Xchange color label or Apple\'s $MailFlagBit*) instead of, or in addition to, the \\Flagged system flag. After any flagged search, inspect each result\'s customKeywords field before concluding a message is or isn\'t flagged — do not rely on the flagged filter alone. Search for emails matching criteria (sender, recipient, subject, body text, date range, read/flagged status). Use this to FIND messages when you know something about them but not their UID — e.g. "emails from amazon last week", "unread invoices". By default searches a single folder (INBOX). Set searchAllFolders=true to scan every mailbox at once — this catches messages filed away by rules (e.g. a receipt routed to a custom folder); Trash/Spam/Drafts are skipped unless you opt in. Returns lightweight headers (uid, from, subject, date, and folder when searching across folders); call imap_get_email with a returned uid + folder to read full content. For the newest messages without criteria, prefer imap_get_latest_emails.',
+    description: 'Note: on some servers a \'flagged\' or starred message carries a custom keyword (e.g. an Open-Xchange color label or Apple\'s $MailFlagBit*) instead of, or in addition to, the \\Flagged system flag. After any flagged search, inspect each result\'s customKeywords field before concluding a message is or isn\'t flagged — do not rely on the flagged filter alone. Search for emails matching criteria (sender, recipient, subject, body text, date range, read/flagged status). Use this to FIND messages when you know something about them but not their UID — e.g. "emails from amazon last week", "unread invoices". By default searches a single folder (INBOX). Set searchAllFolders=true to scan every mailbox at once — this catches messages filed away by rules (e.g. a receipt routed to a custom folder); Trash/Spam/Drafts are skipped unless you opt in. By default returns lightweight headers (uid, from, subject, date, and folder when searching across folders); set `includeBody=true` to also return the parsed body in one round-trip instead of paying the N+1 cost of calling imap_get_email per match. For the newest messages without criteria, prefer imap_get_latest_emails.',
     inputSchema: {
       ...accountSelector,
       folder: z.string().default('INBOX').describe('Folder name to search (default: INBOX). Ignored when searchAllFolders is true.'),
@@ -69,8 +93,11 @@ export function emailTools(
       keywords: z.array(z.string()).optional().describe('Match messages that have ANY of these CUSTOM keywords (server-side OR; not system flags like \\Seen/\\Flagged). Read a mailbox\'s available custom keywords from imap_folder_status\'s customKeywords field, then pass the ones you want here.'),
       unKeywords: z.array(z.string()).optional().describe('Exclude messages that have ANY of these CUSTOM keywords (server-side; result has NONE of them). Same keyword source as `keywords` — check imap_folder_status first.'),
       limit: z.coerce.number().optional().default(50).describe('Maximum number of results'),
+      includeBody: z.boolean().default(false).describe('If true, also fetch the parsed message body in the same round-trip and return it alongside headers (avoids the N+1 cost of calling imap_get_email per match). Body is rendered per `bodyFormat` and capped at `bodyMaxLength` characters per field. Off by default to preserve lightweight behavior.'),
+      bodyFormat: z.enum(['markdown', 'text', 'html', 'auto']).default('markdown').describe('How to render the body when `includeBody` is true. Mirrors `imap_get_email` — "markdown" (default) returns clean Markdown and omits raw HTML so it never crosses the MCP boundary; "text" returns plain text; "html" returns raw HTML; "auto" prefers substantive text/plain, else Markdown.'),
+      bodyMaxLength: z.coerce.number().default(10000).describe('Per-message cap (in characters) for each rendered body field when `includeBody` is true. Defaults to 10000 to match `imap_get_email`.'),
     }
-  }, async ({ accountId: rawAccountId, accountName, folder, limit, searchAllFolders, includeTrash, includeSpam, includeDrafts, ...searchCriteria }) => {
+  }, async ({ accountId: rawAccountId, accountName, folder, limit, searchAllFolders, includeTrash, includeSpam, includeDrafts, includeBody = false, bodyFormat = 'markdown', bodyMaxLength = 10000, ...searchCriteria }) => {
     const accountId = accountManager.resolveAccountId(rawAccountId, accountName);
     const criteria: any = {};
 
@@ -85,6 +112,14 @@ export function emailTools(
     if (searchCriteria.messageId) criteria.messageId = searchCriteria.messageId;
     if (searchCriteria.keywords && searchCriteria.keywords.length > 0) criteria.keywords = searchCriteria.keywords;
     if (searchCriteria.unKeywords && searchCriteria.unKeywords.length > 0) criteria.unKeywords = searchCriteria.unKeywords;
+
+    // #106: cross-folder search also supports includeBody, but we deliberately
+    // do not pass includeBody through here — pulling RFC822 source for every
+    // match across many folders multiplies bandwidth and parse cost. Callers
+    // wanting bodies in a cross-folder sweep should follow up with imap_get_email
+    // for the specific uids they care about. Documented limitation.
+    // Always pass concrete defaults so the service receives stable values.
+    const searchOptions = searchAllFolders ? undefined : { includeBody, bodyFormat, bodyMaxLength };
 
     // Cross-folder search: scan every selectable mailbox (minus the noisy ones,
     // unless opted in). A folder that fails to open is surfaced in foldersErrored
@@ -130,8 +165,12 @@ export function emailTools(
       };
     }
 
-    const messages = await imapService.searchEmails(accountId, folder, criteria);
-    const limitedMessages = messages.slice(0, limit);
+    const messages = await imapService.searchEmails(accountId, folder, criteria, searchOptions);
+
+    // Sort by internalDate DESC before applying limit so callers get the
+    // newest matches, mirroring the searchAllFolders path above (#107).
+    const sortedMessages = messages.sort((a, b) => b.date.getTime() - a.date.getTime());
+    const limitedMessages = sortedMessages.slice(0, limit);
 
     return {
       content: [{
@@ -354,22 +393,38 @@ export function emailTools(
 
   // Mark email as read tool
   server.registerTool('imap_mark_as_read', {
-    description: 'Mark an email as read',
+    description: 'Mark one or many emails as read. Accepts a single UID or an array — pass an array to flag N messages in one IMAP STORE round-trip (useful when triaging).',
     inputSchema: {
       ...accountSelector,
       folder: z.string().default('INBOX').describe('Folder name'),
-      uid: z.coerce.number().describe('Email UID'),
+      uid: z.union([z.coerce.number(), z.array(z.coerce.number())]).describe('Email UID, or array of UIDs to mark as read in one call (avoids N round-trips when triaging). All listed UIDs share the same IMAP STORE command, so the operation is atomic at the server level.'),
     }
   }, async ({ accountId: rawAccountId, accountName, folder, uid }) => {
     const accountId = accountManager.resolveAccountId(rawAccountId, accountName);
-    await imapService.markAsRead(accountId, folder, uid);
-    
+    const result = await imapService.markAsRead(accountId, folder, uid);
+
+    const isBatch = Array.isArray(uid);
+    if (!isBatch) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            message: `Email ${uid} marked as read`,
+          }, null, 2)
+        }]
+      };
+    }
     return {
       content: [{
         type: 'text',
         text: JSON.stringify({
-          success: true,
-          message: `Email ${uid} marked as read`,
+          success: result.failed.length === 0,
+          batch: true,
+          message: `Marked ${result.marked.length}/${uid.length} emails as read`,
+          marked: result.marked,
+          failed: result.failed,
+          ...(result.errors ? { errors: result.errors } : {}),
         }, null, 2)
       }]
     };
@@ -377,22 +432,38 @@ export function emailTools(
 
   // Mark email as unread tool
   server.registerTool('imap_mark_as_unread', {
-    description: 'Mark an email as unread',
+    description: 'Mark one or many emails as unread. Accepts a single UID or an array — pass an array to flag N messages in one IMAP STORE round-trip.',
     inputSchema: {
       ...accountSelector,
       folder: z.string().default('INBOX').describe('Folder name'),
-      uid: z.coerce.number().describe('Email UID'),
+      uid: z.union([z.coerce.number(), z.array(z.coerce.number())]).describe('Email UID, or array of UIDs to mark as unread in one call (avoids N round-trips when triaging). All listed UIDs share the same IMAP STORE command, so the operation is atomic at the server level.'),
     }
   }, async ({ accountId: rawAccountId, accountName, folder, uid }) => {
     const accountId = accountManager.resolveAccountId(rawAccountId, accountName);
-    await imapService.markAsUnread(accountId, folder, uid);
+    const result = await imapService.markAsUnread(accountId, folder, uid);
 
+    const isBatch = Array.isArray(uid);
+    if (!isBatch) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            message: `Email ${uid} marked as unread`,
+          }, null, 2)
+        }]
+      };
+    }
     return {
       content: [{
         type: 'text',
         text: JSON.stringify({
-          success: true,
-          message: `Email ${uid} marked as unread`,
+          success: result.failed.length === 0,
+          batch: true,
+          message: `Marked ${result.marked.length}/${uid.length} emails as unread`,
+          marked: result.marked,
+          failed: result.failed,
+          ...(result.errors ? { errors: result.errors } : {}),
         }, null, 2)
       }]
     };
@@ -521,33 +592,58 @@ export function emailTools(
     inputSchema: {
       ...accountSelector,
       folder: z.string().default('INBOX').describe('Source folder name'),
-      uid: z.coerce.number().describe('Email UID'),
+      uid: z.union([z.coerce.number(), z.array(z.coerce.number())]).describe('Single email UID or array of UIDs to move in one call. Pass an array when triaging many messages at once (e.g. "move the 10 invoices I just classified to Archive") to avoid N round-trips.'),
       targetFolder: z.string().describe('Destination folder name'),
       createDestinationIfMissing: z.boolean().optional().describe('If true, create the destination folder before moving when it does not exist (default: false)'),
     }
   }, async ({ accountId: rawAccountId, accountName, folder, uid, targetFolder, createDestinationIfMissing }) => {
     const accountId = accountManager.resolveAccountId(rawAccountId, accountName);
+    const isBatch = Array.isArray(uid);
     try {
       const result = await imapService.moveEmail(accountId, folder, uid, targetFolder, {
         createDestinationIfMissing,
       });
 
-      const uidMapObj: Record<string, number> = {};
-      if (result.uidMap) {
-        for (const [srcUid, destUid] of result.uidMap) {
-          uidMapObj[String(srcUid)] = destUid;
+      // Single-uid legacy response shape (uidMap at top level).
+      if (!isBatch) {
+        const single = result as { destination: string; destinationCreated?: boolean; uidMap?: Map<number, number> };
+        const uidMapObj: Record<string, number> = {};
+        if (single.uidMap) {
+          for (const [srcUid, destUid] of single.uidMap) {
+            uidMapObj[String(srcUid)] = destUid;
+          }
         }
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              message: `Email ${uid} moved from ${folder} to ${targetFolder}`,
+              destination: single.destination,
+              destinationCreated: single.destinationCreated,
+              uidMap: Object.keys(uidMapObj).length > 0 ? uidMapObj : undefined,
+            }, null, 2)
+          }]
+        };
       }
 
+      // Batch response shape (#106): per-uid results + aggregate counts.
+      const batch = result as { destination: string; destinationCreated?: boolean; results: Array<{ uid: number; destination: string; uidMap?: Record<number, number>; error?: string }> };
+      const succeeded = batch.results.filter(r => !r.error);
+      const failed = batch.results.filter(r => r.error);
       return {
         content: [{
           type: 'text',
           text: JSON.stringify({
-            success: true,
-            message: `Email ${uid} moved from ${folder} to ${targetFolder}`,
-            destination: result.destination,
-            destinationCreated: result.destinationCreated,
-            uidMap: Object.keys(uidMapObj).length > 0 ? uidMapObj : undefined,
+            success: failed.length === 0,
+            batch: true,
+            message: `Moved ${succeeded.length}/${batch.results.length} emails from ${folder} to ${targetFolder}`,
+            destination: batch.destination,
+            destinationCreated: batch.destinationCreated,
+            movedCount: succeeded.length,
+            failedCount: failed.length,
+            results: batch.results,
+            ...(failed.length > 0 ? { errors: failed.map(f => ({ uid: f.uid, error: f.error })) } : {}),
           }, null, 2)
         }]
       };
@@ -679,15 +775,18 @@ export function emailTools(
 
   // Get latest emails tool
   server.registerTool('imap_get_latest_emails', {
-    description: 'Get the most recent emails from a folder, newest first. Use this for "what just came in?" / "show my latest inbox messages" when no search filter is needed. Returns lightweight headers (uid, from, subject, date); read a specific one with imap_get_email. To filter by sender/subject/date instead, use imap_search_emails.',
+    description: 'Get the most recent emails from a folder, newest first. Use this for "what just came in?" / "show my latest inbox messages" when no search filter is needed. By default returns lightweight headers (uid, from, subject, date); set `includeBody=true` to also return the parsed body in one round-trip instead of paying the N+1 cost of calling imap_get_email per message. To filter by sender/subject/date instead, use imap_search_emails.',
     inputSchema: {
       ...accountSelector,
       folder: z.string().default('INBOX').describe('Folder name'),
       count: z.coerce.number().default(10).describe('Number of emails to retrieve'),
+      includeBody: z.boolean().default(false).describe('If true, also fetch the parsed message body in the same round-trip and return it alongside headers (avoids the N+1 cost of calling imap_get_email per message). Body is rendered per `bodyFormat` and capped at `bodyMaxLength` characters per field. Off by default to preserve lightweight behavior.'),
+      bodyFormat: z.enum(['markdown', 'text', 'html', 'auto']).default('markdown').describe('How to render the body when `includeBody` is true. Mirrors `imap_get_email` — "markdown" (default) returns clean Markdown; "text" returns plain text; "html" returns raw HTML; "auto" prefers substantive text/plain, else Markdown.'),
+      bodyMaxLength: z.coerce.number().default(10000).describe('Per-message cap (in characters) for each rendered body field when `includeBody` is true. Defaults to 10000 to match `imap_get_email`.'),
     }
-  }, async ({ accountId: rawAccountId, accountName, folder, count }) => {
+  }, async ({ accountId: rawAccountId, accountName, folder, count, includeBody = false, bodyFormat = 'markdown', bodyMaxLength = 10000 }) => {
     const accountId = accountManager.resolveAccountId(rawAccountId, accountName);
-    const sortedMessages = await imapService.getLatestEmails(accountId, folder, count);
+    const sortedMessages = await imapService.getLatestEmails(accountId, folder, count, { includeBody, bodyFormat, bodyMaxLength });
     
     return {
       content: [{
@@ -712,12 +811,7 @@ export function emailTools(
       cc: z.union([z.string(), z.array(z.string())]).optional().describe('CC recipients'),
       bcc: z.union([z.string(), z.array(z.string())]).optional().describe('BCC recipients'),
       replyTo: z.string().optional().describe('Reply-to address'),
-      attachments: z.array(z.object({
-        filename: z.string().describe('Attachment filename'),
-        content: z.string().optional().describe('Base64 encoded content'),
-        path: z.string().optional().describe('File path to attach'),
-        contentType: z.string().optional().describe('MIME type'),
-      })).optional().describe('Email attachments'),
+      attachments: z.array(attachmentSchema).optional().describe('Email attachments'),
     }
   }, async ({ accountId: rawAccountId, accountName, to, subject, text, html, body, cc, bcc, replyTo, attachments }) => {
     const accountId = accountManager.resolveAccountId(rawAccountId, accountName);
@@ -776,12 +870,7 @@ export function emailTools(
       replyTo: z.string().optional().describe('Reply-to address'),
       inReplyTo: z.string().optional().describe('Message-Id being replied to'),
       references: z.union([z.string(), z.array(z.string())]).optional().describe('References header value(s)'),
-      attachments: z.array(z.object({
-        filename: z.string().describe('Attachment filename'),
-        content: z.string().optional().describe('Base64 encoded content'),
-        path: z.string().optional().describe('File path to attach'),
-        contentType: z.string().optional().describe('MIME type'),
-      })).optional().describe('Email attachments'),
+      attachments: z.array(attachmentSchema).optional().describe('Email attachments'),
       folder: z.string().optional().describe('Override the Drafts folder name (defaults to auto-detected Drafts folder)'),
     }
   }, async ({ accountId: rawAccountId, accountName, to, subject, text, html, body, cc, bcc, replyTo, inReplyTo, references, attachments, folder }) => {
@@ -840,12 +929,7 @@ export function emailTools(
       html: z.string().optional().describe('HTML reply content'),
       body: z.string().optional().describe("Alias for 'text' (backward-compat)"),
       replyAll: z.boolean().default(false).describe('Reply to all recipients'),
-      attachments: z.array(z.object({
-        filename: z.string().describe('Attachment filename'),
-        content: z.string().optional().describe('Base64 encoded content'),
-        path: z.string().optional().describe('File path to attach'),
-        contentType: z.string().optional().describe('MIME type'),
-      })).optional().describe('Email attachments'),
+      attachments: z.array(attachmentSchema).optional().describe('Email attachments'),
     }
   }, async ({ accountId: rawAccountId, accountName, folder, uid, text, html, body, replyAll, attachments }) => {
     const accountId = accountManager.resolveAccountId(rawAccountId, accountName);
@@ -977,18 +1061,25 @@ export function emailTools(
   server.registerTool('imap_find_thread_messages', {
     description:
       'Find messages in `searchFolder` that belong to the same conversation threads as messages already in `sourceFolder`. ' +
-      'Useful for catching replies that arrived after a thread was sorted. Works on any IMAP server (uses RFC 3501 HEADER search on In-Reply-To and References).',
+      'Useful for catching replies that arrived after a thread was sorted. Works on any IMAP server (uses RFC 3501 HEADER search on In-Reply-To and References). ' +
+      'Set `includeBody=true` to also return the parsed body for each found thread message in one round-trip — avoids the N+1 cost of calling imap_get_email per thread member.',
     inputSchema: {
       ...accountSelector,
       sourceFolder: z.string().describe('Folder containing the already-sorted thread messages (e.g. "Review.Articles")'),
       searchFolder: z.string().default('INBOX').describe('Folder to search for related thread messages (default: INBOX)'),
       searchReferences: z.boolean().optional().describe('Also search the References header for multi-level threads (default: true)'),
+      includeBody: z.boolean().default(false).describe('If true, also fetch the parsed message body for each found thread message in the same round-trip and return it alongside headers (avoids the N+1 cost of calling imap_get_email per thread member). Body is rendered per `bodyFormat` and capped at `bodyMaxLength` characters per field.'),
+      bodyFormat: z.enum(['markdown', 'text', 'html', 'auto']).default('markdown').describe('How to render the body when `includeBody` is true. Mirrors `imap_get_email` — "markdown" (default) returns clean Markdown; "text" returns plain text; "html" returns raw HTML; "auto" prefers substantive text/plain, else Markdown.'),
+      bodyMaxLength: z.coerce.number().default(10000).describe('Per-message cap (in characters) for each rendered body field when `includeBody` is true. Defaults to 10000 to match `imap_get_email`.'),
     }
-  }, async ({ accountId: rawAccountId, accountName, sourceFolder, searchFolder, searchReferences }) => {
+  }, async ({ accountId: rawAccountId, accountName, sourceFolder, searchFolder, searchReferences = true, includeBody = false, bodyFormat = 'markdown', bodyMaxLength = 10000 }) => {
     const accountId = accountManager.resolveAccountId(rawAccountId, accountName);
     try {
       const result = await imapService.findThreadMessages(accountId, sourceFolder, searchFolder, {
         searchReferences,
+        includeBody,
+        bodyFormat,
+        bodyMaxLength,
       });
       return {
         content: [{
@@ -1000,6 +1091,7 @@ export function emailTools(
             sourceMessageIdCount: result.messageIds.length,
             threadMessageCount: result.uids.length,
             uids: result.uids,
+            ...(result.messages ? { messages: result.messages } : {}),
           }, null, 2)
         }]
       };

@@ -51,7 +51,7 @@ export function folderTools(
   }, async ({ accountId: rawAccountId, accountName, folder }) => {
     const accountId = accountManager.resolveAccountId(rawAccountId, accountName);
     const box = await imapService.selectFolder(accountId, folder);
-    const customKeywords = Array.from(box.flags || []).filter((f: string) => !isSystemFlag(f));
+    const customKeywords = (Array.from(box.flags || []) as string[]).filter(f => !isSystemFlag(f));
 
     return {
       content: [{
