@@ -1,9 +1,22 @@
 {
   "name": "imap-mcp-server",
-  "version": "1.5.2",
+  "version": "1.6.0",
   "description": "A powerful Model Context Protocol (MCP) server for IMAP email integration with Claude",
   "mcpName": "io.github.nikolausm/imap-mcp-server",
   "main": "dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./smtp": {
+      "types": "./dist/smtp.d.ts",
+      "import": "./dist/smtp.js",
+      "default": "./dist/smtp.js"
+    }
+  },
   "bin": {
     "imap-mcp-server": "dist/index.js",
     "imap-mcp": "dist/index.js",

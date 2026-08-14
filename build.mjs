@@ -1,5 +1,6 @@
 import * as esbuild from 'esbuild';
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync } from 'fs';
+import { execSync } from 'child_process';
 
 const pkg = JSON.parse(readFileSync('./package.json', 'utf8'));
 
@@ -43,5 +44,25 @@ await esbuild.build({
   outfile: 'dist/web/server.js',
   external,
 });
+
+// Build smtp entry point — the send-only `imap-mcp-server/smtp` subpath.
+// A library entry, not a bin: no shebang banner. metafile is written out so
+// tests/smtp-export-isolation.test.ts can assert on the actual import graph
+// (all deps are external here, so grepping the bundle proves nothing).
+const smtpResult = await esbuild.build({
+  entryPoints: ['src/smtp.ts'],
+  bundle: true,
+  platform: 'node',
+  format: 'esm',
+  outfile: 'dist/smtp.js',
+  external,
+  metafile: true,
+});
+writeFileSync('dist/smtp.meta.json', JSON.stringify(smtpResult.metafile, null, 2));
+
+// Type declarations — esbuild emits no .d.ts, so a strict-TypeScript consumer
+// of `imap-mcp-server/smtp` needs this to typecheck. Declaration-only so it
+// never overwrites the bundled JS esbuild just produced above.
+execSync('tsc --emitDeclarationOnly', { stdio: 'inherit' });
 
 console.log('Build complete!');
